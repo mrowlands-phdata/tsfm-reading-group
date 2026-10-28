@@ -15,6 +15,11 @@ assumptions, then backtests twelve forecasting methods on it:
 Scenarios: `baseline`, `drivers` (promotions, weather, holiday closures), `regime_shift`,
 `intermittent`, and `cold_start`.
 
+**Stress tests (section 7)** are data built to make the foundation models fail:
+`seasonal_cold_start`, `annual_calendar`, `nonlinear_drivers` (round 1, mostly survived by the
+TSFMs), then `price_rollout` and `fresh_openings` (round 2, where they clearly lose to pooled and
+structural models).
+
 ## Run it
 
 Requires [uv](https://docs.astral.sh/uv/). Everything is pinned in `uv.lock`, and the dependency
@@ -33,14 +38,14 @@ uv run jupyter nbconvert --to notebook --execute --inplace \
     --ExecutePreprocessor.timeout=-1 restaurant_demand_forecasting.ipynb
 ```
 
-* **Runtime.** A full run from scratch takes about 45 minutes on a 12-core Apple-silicon laptop
-  (≈9 min per scenario), roughly 60% of it on the Bayesian model (15 NUTS fits). On a laptop,
+* **Runtime.** A full run from scratch takes about 1.5 hours on a 12-core Apple-silicon laptop
+  (≈9–10 min per scenario × 10 scenarios), roughly 60% of it on the Bayesian model (30 NUTS fits). On a laptop,
   prefix the command with `caffeinate -i` so macOS doesn't sleep and pause the run.
 * **Cache.** The repo ships with the forecasts from the full run in `results/full/`, so executing
   the notebook only re-scores and re-plots (~2 minutes, mostly loading the foundation models).
   Delete that folder, or set `RECOMPUTE = True`, to recompute.
 * **Smoke test.** `FAST=1 uv run jupyter lab` (or prefix the nbconvert command) uses one
-  origin and shorter MCMC, and writes to `results/fast/`. It takes about 12 minutes.
+  origin and shorter MCMC, and writes to `results/fast/`. It takes about 25 minutes.
 * **Model weights** (Chronos-2, Chronos-Bolt-base, TimesFM 2.5; ~1 GB total) download from
   Hugging Face on first run. TimesFM 3.0 is deliberately not used: its weights are licensed for
   non-commercial use only.

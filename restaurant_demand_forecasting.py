@@ -38,9 +38,13 @@
 # - Hyndman & Athanasopoulos, *Forecasting: Principles and Practice* (3rd ed.), on ETS, ARIMA, MSTL and accuracy measures
 # - Makridakis et al., *M5 accuracy competition* (2022), where LightGBM global models won on retail data
 #
-# > Running the whole backtest takes roughly 20–40 minutes on a laptop CPU. Forecasts are
-# > cached in `results/`, so re-running the notebook only re-scores and re-plots them.
-# > Set `FAST=1` in the environment for a quick smoke-test run.
+# Sections 1–6 cover five everyday scenarios. **Section 7 is a set of stress tests**: data built to
+# make the foundation models fail, with hypotheses written down before each run. Several of the
+# hypotheses turned out to be wrong.
+#
+# > Running the whole backtest from scratch takes about 1.5 hours on a laptop CPU, mostly for
+# > the Bayesian model. Forecasts are cached in `results/`, so re-running the notebook only
+# > re-scores and re-plots them. Set `FAST=1` in the environment for a quick smoke-test run.
 
 # %%
 import logging
@@ -81,6 +85,7 @@ START, END = pd.Timestamp("2022-07-04"), pd.Timestamp("2024-12-31")
 ORIGINS_ALL = pd.to_datetime(["2024-07-02", "2024-09-24", "2024-12-03"])
 ORIGINS = ORIGINS_ALL[-1:] if FAST else ORIGINS_ALL
 COVARIATES = ["promo", "temp", "rain", "closed"]  # known for the forecast window
+EXTRA_COVARIATES = ()  # scenario-specific known covariates (section 7); set by run_scenario while it runs
 RESULTS_DIR = Path("results") / ("fast" if FAST else "full")
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -157,6 +162,15 @@ class Scenario:
     closures: bool = False  # closed on Thanksgiving and Christmas
     breaks: bool = False  # sudden level shifts shortly before each forecast origin
     cold_start: bool = False  # half the stores opened shortly before the first origin
+    # Used by the stress tests in section 7:
+    yearly_strength: float = 1.0  # multiplies every item's yearly amplitude
+    holiday_season: float = 0.0  # log-lift Dec 8–23 at mall and suburban stores (holiday shopping)
+    staggered_openings: bool = False  # S3/S4/S5 open 41 days before origins 1/2/3
+    annual_calendar: bool = False  # academic terms at the downtown (campus) stores + fixed-date local events
+    nonlinear_drivers: bool = False  # promo and weather act through thresholds and interactions
+    price_rollout: bool = False  # 15% price rises store by store; log price is a known covariate
+    fresh_openings: bool = False  # S3/S4/S5 open 10 days before origins 1/2/3, with an opening buzz
+    extra_covariates: tuple = ()  # scenario columns passed to the covariate-aware methods
 
 
 SCENARIOS = [
@@ -276,6 +290,68 @@ def simulate(sc: Scenario, seed: int = SEED) -> pd.DataFrame:
             age = np.clip(day - open_day[s], 0, None)
             honeymoon[s] = 0.45 * np.exp(-age / 40)
             segment[s] = "new store"
+    if sc.staggered_openings:
+        for s, k in [(3, 0), (4, 1), (5, 2)]:
+            open_day[s] = o_idx[k] - 41  # opens after the previous test window ends
+            segment[s] = "new store"
+    if sc.fresh_openings:
+        for s, k in [(3, 0), (4, 1), (5, 2)]:
+            open_day[s] = o_idx[k] - 10
+            age = np.clip(day - open_day[s], 0, None)
+            honeymoon[s] = 0.6 * np.exp(-age / 30)
+            segment[s] = "new store"
+
+    # Additional effects for the stress tests; none of these draw random numbers, so the
+    # scenarios above are unchanged.
+    extra = np.zeros((n_stores, n_items, n_days))
+    store_type = STORES.store_type.to_numpy()
+    month_day = dates.month.to_numpy() * 100 + dates.day.to_numpy()  # e.g. 704 = July 4
+    if sc.holiday_season:
+        in_season = (month_day >= 1208) & (month_day <= 1223)
+        extra[np.isin(store_type, ["mall", "suburban"])] += sc.holiday_season * in_season
+    known_cols = {}  # extra known-in-advance columns written to the data
+    if sc.annual_calendar:
+        in_term = ((month_day >= 826) & (month_day <= 1213)) | ((month_day >= 113) & (month_day <= 509))
+        campus = store_type == "downtown"
+        extra[campus] += -0.7 * (~in_term)
+        segment[campus] = "campus store"
+        events = [  # (first month-day, last month-day, log effect, regions)
+            (703, 704, 0.6, (0, 1)),  # Independence Day weekend
+            (927, 1006, 0.5, (1,)),  # state fair, region 1 only
+            (1214, 1222, 0.3, (0, 1)),  # holiday-party catering
+            (1224, 1224, -0.6, (0, 1)),  # Christmas Eve
+            (1226, 1231, -0.35, (0, 1)),  # post-Christmas lull
+            (214, 214, 0.3, (0, 1)),  # Valentine's Day
+        ]
+        event_up, event_down = np.zeros((n_stores, n_days)), np.zeros((n_stores, n_days))
+        for first, last, effect, regions in events:
+            on = (month_day >= first) & (month_day <= last)
+            for s in np.flatnonzero(np.isin(STORES.region, regions)):
+                extra[s] += effect * on
+                (event_up if effect > 0 else event_down)[s] = np.maximum((event_up if effect > 0 else event_down)[s], on)
+        # Known in advance, but NOT passed to the models in COVARIATES. Section 7 tests what happens when they are.
+        known_cols |= {"off_term": np.outer(campus, ~in_term).astype(float), "event_up": event_up, "event_down": event_down}
+    if sc.price_rollout:
+        log_price = np.zeros((n_stores, n_days))
+        early = (pd.Timestamp("2024-03-05") - START).days
+        for s, d0 in [(0, early), (1, early), (2, o_idx[0] + 2), (3, o_idx[1] + 2), (5, o_idx[1] + 2), (4, o_idx[2] + 2)]:
+            log_price[s, d0:] = np.log(1.15)
+        for i in range(n_items):
+            extra[:, i] += -1.3 * ITEMS.promo_sens[i] * log_price  # price elasticity ≈ −1.3
+        known_cols["log_price"] = log_price
+    if sc.nonlinear_drivers:
+        weekend = dow >= 5
+        promo_lift = {"downtown": np.where(weekend, 0.0, 0.8), "mall": np.where(weekend, 0.8, 0.1),
+                      "suburban": np.full(n_days, 0.4)}
+        for s in range(n_stores):
+            r = STORES.region[s]
+            heat = 1 / (1 + np.exp(-(temp[r] - 88) / 2))  # kicks in sharply above ~88°F
+            ice = (temp[r] < 37) & (rain[r] == 1)  # near-freezing rain
+            extra[s] += -1.0 * ice - 0.4 * (rain[r] * weekend)
+            extra[s, (ITEMS.item == "milkshake").to_numpy()] += 0.9 * heat
+            extra[s, (ITEMS.item == "salad").to_numpy()] += 0.3 * heat
+            for i in range(n_items):
+                extra[s, i] += ITEMS.promo_sens[i] * (promo_lift[store_type[s]] * promo[i] - 0.2 * post_promo[i])
 
     shock = rng.normal(0, sc.shock_sd, (n_stores, n_days))
     region_of = STORES.region.to_numpy()
@@ -287,10 +363,10 @@ def simulate(sc: Scenario, seed: int = SEED) -> pd.DataFrame:
             log_mu = (
                 np.log(sc.base_scale) + size[s] + np.log(it.share) + growth[s] * (t_years - t_years[-1])
                 + store_dow[s, day, dow] + ITEM_DOW[i, dow]
-                + it.yearly_amp * np.cos(2 * np.pi * (doy - it.yearly_peak_doy) / 365.25)
+                + sc.yearly_strength * it.yearly_amp * np.cos(2 * np.pi * (doy - it.yearly_peak_doy) / 365.25)
                 + sc.weather_effect * (it.temp_sens * (temp[r] - 65) - 0.12 * rain[r])
                 + sc.promo_lift * it.promo_sens * (promo[i] - 0.3 * post_promo[i])
-                + shift[s] + honeymoon[s]
+                + shift[s] + honeymoon[s] + extra[s, i]
             )
             mu_daily = np.exp(log_mu + shock[s])
             y = rng.negative_binomial(sc.dispersion, sc.dispersion / (sc.dispersion + mu_daily))
@@ -302,6 +378,7 @@ def simulate(sc: Scenario, seed: int = SEED) -> pd.DataFrame:
                 "segment": segment[s], "ds": dates[keep], "y": y[keep].astype(float),
                 "promo": promo[i, keep], "temp": temp[r, keep].round(1), "rain": rain[r, keep],
                 "closed": closed[keep].astype(float),
+                **{c: v[s, keep] for c, v in known_cols.items()},
                 # Hidden from every model except the oracle: mean excluding the unforecastable shock.
                 "mu_true": np.where(closed, 0.0, np.exp(log_mu))[keep],
             }))
@@ -516,7 +593,7 @@ def _post_promo(promo: np.ndarray) -> np.ndarray:
     return post * (1 - promo)
 
 
-def _wide(train, future):
+def _wide(train, future, extra_covariates=()):
     """Pivot to (series × day) arrays with PAD NaN days in front."""
     full = pd.concat([train, future.assign(y=np.nan)], ignore_index=True)
     dates = pd.date_range(full.ds.min() - pd.Timedelta(days=PAD), full.ds.max(), freq="D")
@@ -525,7 +602,8 @@ def _wide(train, future):
     def piv(col):
         return full.pivot(index="unique_id", columns="ds", values=col).reindex(index=ids, columns=dates).to_numpy(float)
 
-    W = {c: piv(c) for c in ["y", *COVARIATES]}
+    W = {c: piv(c) for c in ["y", *COVARIATES, *extra_covariates]}
+    W["extra_covariates"] = list(extra_covariates)
     W["y_target"] = W["y"].copy()  # closed days stay 0 as targets...
     W["y"][W["closed"] == 1] = np.nan  # ...but are ignored as features
     W["promo"] = np.nan_to_num(W["promo"])
@@ -562,6 +640,7 @@ def _features(W, o):
                 "promo": W["promo"][:, d], "post_promo": W["post_promo"][:, d],
                 "temp": W["temp"][:, d], "rain": W["rain"][:, d], "closed": W["closed"][:, d],
                 "item": W["item_code"], "store": W["store_code"],
+                **{c: W[c][:, d] for c in W["extra_covariates"]},
                 "target": W["y_target"][:, d] / scale, "d": d,
             }))
     return pd.concat(rows, ignore_index=True)
@@ -571,8 +650,10 @@ LGB_FEATURES = ["k", "last1", "last7", "same_dow4", "ly_ratio", "age", "dow", "d
                 "promo", "post_promo", "temp", "rain", "closed", "item", "store"]
 
 
-def fc_lightgbm(train, future):
-    W = _wide(train, future)
+def fc_lightgbm(train, future, extra_covariates=None):
+    extra_covariates = EXTRA_COVARIATES if extra_covariates is None else extra_covariates
+    W = _wide(train, future, extra_covariates)
+    features = LGB_FEATURES + list(extra_covariates)
     o_end = W["dates"].get_loc(train.ds.max())
     first = PAD + 28
     tr = pd.concat([_features(W, o) for o in range(first, o_end - 1, 5)], ignore_index=True)
@@ -581,8 +662,8 @@ def fc_lightgbm(train, future):
     preds = {}
     for q, col in zip(QUANTILES, Q_COLS):
         model = lgb.LGBMRegressor(objective="quantile", alpha=q, random_state=SEED, **LGB_PARAMS)
-        model.fit(tr[LGB_FEATURES], tr.target, sample_weight=tr.scale, categorical_feature=["item", "store"])
-        preds[col] = model.predict(te[LGB_FEATURES]) * te.scale.to_numpy()
+        model.fit(tr[features], tr.target, sample_weight=tr.scale, categorical_feature=["item", "store"])
+        preds[col] = model.predict(te[features]) * te.scale.to_numpy()
     out = pd.DataFrame({"unique_id": np.array(W["ids"])[te.row], "ds": W["dates"][te.d], **preds})
     out["point"] = out["q0.5"]
     return finalize(out)
@@ -669,11 +750,11 @@ def fc_bayes_hierarchical(train, future):
         return {
             "sid": rows.store.map(idx["store"]).to_numpy(), "iid": rows.item.map(idx["item"]).to_numpy(),
             "day": day, "seg": seg_of_day[day], "dow": rows.ds.dt.dayofweek.to_numpy(),
-            "X": np.column_stack([rows.promo, rows.post_promo, (rows.temp - 65) / 10, rows.rain]),
+            "X": np.column_stack([rows.promo, rows.post_promo, (rows.temp - 65) / 10, rows.rain, *[rows[c] for c in EXTRA_COVARIATES]]),
         }
 
     coords = {"store": stores, "item": items, "stype": stypes, "dow": range(7),
-              "fourier": range(2 * N_FOURIER), "cov": X_NAMES, "step": range(1, n_seg)}
+              "fourier": range(2 * N_FOURIER), "cov": X_NAMES + list(EXTRA_COVARIATES), "step": range(1, n_seg)}
     with pm.Model(coords=coords):
         D = {k: pm.Data(f"data_{k}", v) for k, v in rows_to_arrays(hist).items()}
         y_obs = pm.Data("y_obs", hist.y.to_numpy())
@@ -770,11 +851,11 @@ def fc_chronos2(train, future):
 
 
 def fc_chronos2_cov(train, future):
-    return _fm("chronos2", train, future, covariates=COVARIATES)
+    return _fm("chronos2", train, future, covariates=COVARIATES + list(EXTRA_COVARIATES))
 
 
 def fc_chronos2_cov_xl(train, future):
-    return _fm("chronos2", train, future, covariates=COVARIATES, cross_learning=True)
+    return _fm("chronos2", train, future, covariates=COVARIATES + list(EXTRA_COVARIATES), cross_learning=True)
 
 
 FM_POOL.submit(int).result()  # block until the worker has loaded the models
@@ -825,15 +906,25 @@ RECOMPUTE = False
 
 
 def run_scenario(sc: Scenario) -> pd.DataFrame:
+    global EXTRA_COVARIATES
     path = RESULTS_DIR / f"forecasts_{sc.name}.parquet"
     if path.exists() and not RECOMPUTE:
         return pd.read_parquet(path)
+    EXTRA_COVARIATES = sc.extra_covariates
+    try:
+        return _run_scenario(sc, path)
+    finally:
+        EXTRA_COVARIATES = ()
+
+
+def _run_scenario(sc: Scenario, path: Path) -> pd.DataFrame:
     df = DATA[sc.name]
     methods = {**{m: fn for m, (_, fn) in METHODS.items()}, "Oracle": make_oracle(sc)}
     frames = []
     for origin in ORIGINS:
         train = df[df.ds <= origin]
         test = df[(df.ds > origin) & (df.ds <= origin + pd.Timedelta(days=H))]
+        test = test[test.unique_id.isin(train.unique_id.unique())]  # a store must be open to be forecast
         scale = mase_scale(train)
         visible_train = train.drop(columns="mu_true")
         future = test.drop(columns=["y"])  # the oracle needs mu_true, so the other methods drop it below
@@ -859,14 +950,19 @@ FORECASTS = {sc.name: run_scenario(sc) for sc in SCENARIOS}
 
 # %%
 ENSEMBLE_OF = ["AutoETS", "LightGBM", "Chronos-2 +cov"]
-for name, fc in FORECASTS.items():
+
+
+def add_ensemble(fc: pd.DataFrame) -> pd.DataFrame:
     members = fc[fc.method.isin(ENSEMBLE_OF)]
     keys = ["unique_id", "ds", "origin"]
     ens = members.groupby(keys)[["point", *Q_COLS]].mean().reset_index()
     ens = ens.merge(members.drop_duplicates(keys)[[*keys, "y", "store", "item", "segment", "mase_scale"]], on=keys)
     per_origin = members.drop_duplicates(["method", "origin"]).groupby("origin").seconds.sum()
     ens["seconds"] = ens.origin.map(per_origin)
-    FORECASTS[name] = pd.concat([fc[fc.method != "Ensemble"], ens.assign(method="Ensemble")], ignore_index=True)
+    return pd.concat([fc[fc.method != "Ensemble"], ens.assign(method="Ensemble")], ignore_index=True)
+
+
+FORECASTS = {name: add_ensemble(fc) for name, fc in FORECASTS.items()}
 
 # %% [markdown]
 # ## 5. Results
@@ -890,41 +986,54 @@ def summarize(fc: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows).T.reindex([m for m in METHOD_ORDER if m in rows])
 
 
-SUMMARY = pd.concat({name: summarize(fc) for name, fc in FORECASTS.items()}, names=["scenario", "method"])
-rel = SUMMARY[["WQL", "WAPE"]].div(SUMMARY.xs("Seasonal naive", level="method")[["WQL", "WAPE"]], level="scenario")
-
 from matplotlib.colors import LinearSegmentedColormap, LogNorm
 
 DIVERGING = LinearSegmentedColormap.from_list("blue_gray_red", ["#1c5cab", "#86b6ef", "#f0efec", "#ef9a99", "#c23434"])
 SHORT_TITLES = {"baseline": "Steady\nstate", "drivers": "Promos,\nweather,\nholidays", "regime_shift": "Structural\nbreaks",
-                "intermittent": "Low-volume\nitems", "cold_start": "New stores"}
-scen_titles = [SHORT_TITLES[n] for n in FORECASTS]
-fig, axes = plt.subplots(1, 2, figsize=(13, 7.2), sharey=True)
-for ax, metric in zip(axes, ["WQL", "WAPE"]):
-    M = rel[metric].unstack("scenario").reindex(index=METHOD_ORDER, columns=list(FORECASTS))
-    im = ax.imshow(M.to_numpy(float), cmap=DIVERGING, norm=LogNorm(vmin=0.3, vmax=1 / 0.3), aspect="auto")
-    for (r, c), v in np.ndenumerate(M.to_numpy(float)):
-        if np.isfinite(v):
-            ax.text(c, r, f"{v:.2f}", ha="center", va="center", fontsize=8.5,
-                    color="white" if (v < 0.45 or v > 2.2) else INK)
-    ax.set_xticks(range(M.shape[1]), scen_titles, fontsize=8.5)
-    ax.set_yticks(range(M.shape[0]), M.index)
-    ax.tick_params(length=0)
-    ax.tick_params(axis="y", pad=16)  # room for the family swatches
-    ax.grid(False)
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-    ax.set_title(f"{metric} relative to seasonal naive")
-# Family swatches beside the method names (labels stay in ink).
-for r, m in enumerate(METHOD_ORDER):
-    axes[0].add_patch(plt.Rectangle((-0.66, r - 0.4), 0.12, 0.8, color=FAMILY_COLORS[FAMILY[m]], clip_on=False))
-axes[0].legend(handles=[Patch(color=FAMILY_COLORS[f], label=f) for f in ["Foundation", "Classical", "ML", "Bayesian", "Ensemble"]],
-               loc="upper left", bbox_to_anchor=(0, -0.09), ncol=5, fontsize=9)
-cb = fig.colorbar(im, ax=axes, shrink=0.6, pad=0.02, ticks=[0.33, 0.5, 0.75, 1, 1.5, 2, 3])
-cb.ax.minorticks_off()
-cb.ax.set_yticklabels(["0.33", "0.5", "0.75", "1", "1.5", "2", "3"])
-cb.set_label("ratio to seasonal naive (log scale)", color=INK_2)
-plt.show()
+                "intermittent": "Low-volume\nitems", "cold_start": "New stores",
+                "seasonal_cold_start": "New store before\na seasonal swing", "annual_calendar": "Academic calendar\n& annual events",
+                "nonlinear_drivers": "Interacting\ndrivers"}
+
+
+def relative_to_naive(summary):
+    return summary[["WQL", "WAPE"]].div(summary.xs("Seasonal naive", level="method")[["WQL", "WAPE"]], level="scenario")
+
+
+def plot_relative_heatmap(summary, method_order=None):
+    method_order = method_order or METHOD_ORDER
+    names = list(dict.fromkeys(summary.index.get_level_values("scenario")))
+    rel = relative_to_naive(summary)
+    fig, axes = plt.subplots(1, 2, figsize=(4 + 1.8 * len(names), 7.2), sharey=True)
+    for ax, metric in zip(axes, ["WQL", "WAPE"]):
+        M = rel[metric].unstack("scenario").reindex(index=method_order, columns=names)
+        im = ax.imshow(M.to_numpy(float), cmap=DIVERGING, norm=LogNorm(vmin=0.3, vmax=1 / 0.3), aspect="auto")
+        for (r, c), v in np.ndenumerate(M.to_numpy(float)):
+            if np.isfinite(v):
+                ax.text(c, r, f"{v:.2f}", ha="center", va="center", fontsize=8.5,
+                        color="white" if (v < 0.45 or v > 2.2) else INK)
+        ax.set_xticks(range(M.shape[1]), [SHORT_TITLES[n] for n in names], fontsize=8.5)
+        ax.set_yticks(range(M.shape[0]), M.index)
+        ax.tick_params(length=0)
+        ax.tick_params(axis="y", pad=16)  # room for the family swatches
+        ax.grid(False)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.set_title(f"{metric} relative to seasonal naive")
+    # Family swatches beside the method names (labels stay in ink).
+    for r, m in enumerate(method_order):
+        axes[0].add_patch(plt.Rectangle((-0.66, r - 0.4), 0.12, 0.8, color=FAMILY_COLORS[FAMILY[m]], clip_on=False))
+    axes[0].legend(handles=[Patch(color=FAMILY_COLORS[f], label=f) for f in ["Foundation", "Classical", "ML", "Bayesian", "Ensemble"]],
+                   loc="upper left", bbox_to_anchor=(0, -0.09 - 0.02 * (len(names) < 4)), ncol=5 if len(names) > 3 else 3, fontsize=9)
+    cb = fig.colorbar(im, ax=axes, shrink=0.6, pad=0.02, ticks=[0.33, 0.5, 0.75, 1, 1.5, 2, 3])
+    cb.ax.minorticks_off()
+    cb.ax.set_yticklabels(["0.33", "0.5", "0.75", "1", "1.5", "2", "3"])
+    cb.set_label("ratio to seasonal naive (log scale)", color=INK_2)
+    plt.show()
+
+
+SUMMARY = pd.concat({name: summarize(fc) for name, fc in FORECASTS.items()}, names=["scenario", "method"])
+rel = relative_to_naive(SUMMARY)
+plot_relative_heatmap(SUMMARY)
 
 # %% [markdown]
 # Absolute numbers for reference (WQL, WAPE and MASE: lower is better; Cov80 should be ≈ 0.80):
@@ -985,31 +1094,37 @@ plt.show()
 # relative to seasonal naive *on that segment*, so the baseline sits at 1 by construction.
 
 # %%
-seg_rows = []
-for name in ["cold_start", "regime_shift"]:
-    fc = FORECASTS[name]
-    for (m, seg), g in fc.groupby(["method", "segment"]):
-        seg_rows.append({"scenario": name, "method": m, "segment": seg, "WQL": score(g)["WQL"]})
-seg = pd.DataFrame(seg_rows)
-seg["rel"] = seg.WQL / seg.merge(seg[seg.method == "Seasonal naive"], on=["scenario", "segment"], suffixes=("", "_n")).WQL_n.to_numpy()
-seg = seg.dropna()
+def plot_segments(forecasts, names):
+    """WQL relative to seasonal naive on the affected vs. unaffected stores of each scenario."""
+    rows = []
+    for name in names:
+        for (m, segment), g in forecasts[name].groupby(["method", "segment"]):
+            rows.append({"scenario": name, "method": m, "segment": segment, "WQL": score(g)["WQL"]})
+    seg = pd.DataFrame(rows)
+    naive = seg[seg.method == "Seasonal naive"].set_index(["scenario", "segment"]).WQL
+    seg["rel"] = seg.WQL / naive.reindex(pd.MultiIndex.from_frame(seg[["scenario", "segment"]])).to_numpy()
+    seg = seg.dropna()
+    fig, axes = plt.subplots(1, len(names), figsize=(6 * len(names), 5.5), sharey=True, squeeze=False)
+    order = [m for m in METHOD_ORDER if m in seg.method.unique() and m != "Seasonal naive"][::-1]
+    for ax, name in zip(axes[0], names):
+        d = seg[seg.scenario == name]
+        segments = sorted(d.segment.unique(), key=lambda x: x != "established")  # established first, drawn light
+        for segment, color in zip(segments, ["#a3a29d", INK]):
+            dd = d[d.segment == segment].set_index("method").reindex(order)
+            ax.scatter(dd.rel, range(len(order)), color=color, s=55, edgecolor=SURFACE, linewidth=2, zorder=3, label=segment)
+        wide = d.pivot(index="method", columns="segment", values="rel").reindex(order)
+        ax.hlines(range(len(order)), wide.min(1), wide.max(1), color=GRID, lw=2, zorder=2)
+        ax.axvline(1, color=INK_2, lw=0.9, ls="--")
+        ax.set_yticks(range(len(order)), order)
+        ax.set_xlabel("WQL ÷ seasonal-naive WQL on the same segment")
+        ax.set_title(SCENARIO_BY_NAME[name].title)
+        ax.legend(loc="upper right")
+    fig.tight_layout()
+    plt.show()
+    return seg
 
-fig, axes = plt.subplots(1, 2, figsize=(12, 5.5), sharey=True)
-order = [m for m in METHOD_ORDER if m in seg.method.unique() and m != "Seasonal naive"][::-1]
-for ax, name in zip(axes, ["cold_start", "regime_shift"]):
-    d = seg[seg.scenario == name]
-    for segment, color in zip(sorted(d.segment.unique()), ["#a3a29d", INK]):  # established = light, affected = dark
-        dd = d[d.segment == segment].set_index("method").reindex(order)
-        ax.scatter(dd.rel, range(len(order)), color=color, s=55, edgecolor=SURFACE, linewidth=2, zorder=3, label=segment)
-    wide = d.pivot(index="method", columns="segment", values="rel").reindex(order)
-    ax.hlines(range(len(order)), wide.min(1), wide.max(1), color=GRID, lw=2, zorder=2)
-    ax.axvline(1, color=INK_2, lw=0.9, ls="--")
-    ax.set_yticks(range(len(order)), order)
-    ax.set_xlabel("WQL ÷ seasonal-naive WQL on the same segment")
-    ax.set_title(SCENARIO_BY_NAME[name].title)
-    ax.legend(loc="upper right")
-fig.tight_layout()
-plt.show()
+
+plot_segments(FORECASTS, ["cold_start", "regime_shift"]);
 
 # %% [markdown]
 # ### 5d. Calibration
@@ -1041,39 +1156,42 @@ plt.show()
 # %%
 import matplotlib.dates as mdates
 
-CASES = [("drivers", "S0/milkshake", ORIGINS[-1], "Promotions & holidays"),
-         ("regime_shift", "S5/nuggets", ORIGINS[-1], "Competitor opened\n10 days before origin"),
-         ("cold_start", "S5/sandwich", ORIGINS[0], "New store")]
-SHOW = ["AutoETS", "LightGBM", "Bayes hierarchical", "Chronos-2 +cov"]
-fig, axes = plt.subplots(len(CASES), len(SHOW), figsize=(14, 8.5))
-for r, (name, uid, origin, label) in enumerate(CASES):
-    window_start = origin - pd.Timedelta(days=56)
-    hist = DATA[name].query("unique_id == @uid and ds <= @origin and ds > @window_start")
-    age = (origin - DATA[name].query("unique_id == @uid").ds.min()).days
-    label = f"{label}\n{uid}, {age} days of history" if name == "cold_start" else f"{label}\n{uid}"
-    fc_all = FORECASTS[name].query("unique_id == @uid and origin == @origin")
-    ymax = max(hist.y.max(), fc_all.y.max(), fc_all[fc_all.method.isin(SHOW)]["q0.9"].max()) * 1.08
-    for c, m in enumerate(SHOW):
-        ax = axes[r, c]
-        f = fc_all[fc_all.method == m].sort_values("ds")
-        color = FAMILY_COLORS[FAMILY[m]]
-        ax.plot(hist.ds, hist.y, color=INK_2, lw=1, alpha=0.6)
-        ax.fill_between(f.ds, f["q0.1"], f["q0.9"], color=color, alpha=0.22, lw=0)
-        ax.plot(f.ds, f.point, color=color, lw=1.8)
-        ax.plot(f.ds, f.y, color=INK, lw=1)
-        ax.axvline(origin, color=INK_2, ls="--", lw=0.8)
-        ax.set_ylim(0, ymax)
-        wql_m = score(f)["WQL"]
-        ax.text(0.02, 0.96, f"WQL {wql_m:.2f}", transform=ax.transAxes, va="top", fontsize=8.5, color=INK_2)
-        if r == 0:
-            ax.set_title(m, color=INK)
-        if c == 0:
-            ax.set_ylabel(label, fontsize=9)
-        ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO, interval=4))
-        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-        ax.tick_params(axis="x", labelsize=8)
-fig.tight_layout()
-plt.show()
+def plot_cases(forecasts, cases, show):
+    """Rows = (scenario, series, origin, label); columns = methods. Gray = history, black = actual."""
+    fig, axes = plt.subplots(len(cases), len(show), figsize=(3.5 * len(show), 2.85 * len(cases)), squeeze=False)
+    for r, (name, uid, origin, label) in enumerate(cases):
+        window_start = origin - pd.Timedelta(days=56)
+        hist = DATA[name].query("unique_id == @uid and ds <= @origin and ds > @window_start")
+        age = (origin - DATA[name].query("unique_id == @uid").ds.min()).days
+        label = f"{label}\n{uid}, {age} days of history" if age < 365 else f"{label}\n{uid}"
+        fc_all = forecasts[name].query("unique_id == @uid and origin == @origin")
+        ymax = max(hist.y.max(), fc_all.y.max(), fc_all[fc_all.method.isin(show)]["q0.9"].max()) * 1.08
+        for c, m in enumerate(show):
+            ax = axes[r, c]
+            f = fc_all[fc_all.method == m].sort_values("ds")
+            color = FAMILY_COLORS[FAMILY[m]]
+            ax.plot(hist.ds, hist.y, color=INK_2, lw=1, alpha=0.6)
+            ax.fill_between(f.ds, f["q0.1"], f["q0.9"], color=color, alpha=0.22, lw=0)
+            ax.plot(f.ds, f.point, color=color, lw=1.8)
+            ax.plot(f.ds, f.y, color=INK, lw=1)
+            ax.axvline(origin, color=INK_2, ls="--", lw=0.8)
+            ax.set_ylim(0, ymax)
+            ax.text(0.02, 0.96, f"WQL {score(f)['WQL']:.2f}", transform=ax.transAxes, va="top", fontsize=8.5, color=INK_2)
+            if r == 0:
+                ax.set_title(m, color=INK)
+            if c == 0:
+                ax.set_ylabel(label, fontsize=9)
+            ax.xaxis.set_major_locator(mdates.WeekdayLocator(byweekday=mdates.MO, interval=4))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
+            ax.tick_params(axis="x", labelsize=8)
+    fig.tight_layout()
+    plt.show()
+
+
+plot_cases(FORECASTS, [("drivers", "S0/milkshake", ORIGINS[-1], "Promotions & holidays"),
+                       ("regime_shift", "S5/nuggets", ORIGINS[-1], "Competitor opened\n10 days before origin"),
+                       ("cold_start", "S5/sandwich", ORIGINS[0], "New store")],
+           show=["AutoETS", "LightGBM", "Bayes hierarchical", "Chronos-2 +cov"])
 
 # %% [markdown]
 # ### 5f. Bayesian sampler health
@@ -1159,6 +1277,327 @@ display(diag.reset_index(level="_", drop=True))
 # 4. Cold start turned out easy because 45 days covers the dominant (weekly) cycle. What horizon
 #    or history length would make it hard again, and would cross-learning help then?
 # 5. What would a fair test of fine-tuned TSFMs, or a TSFM + LightGBM stack, look like?
+
+# %% [markdown]
+# ## 7. Stress tests: data designed to trip up the foundation models
+#
+# Sections 1–6 were broadly kind to the foundation models. Here we deliberately build data that
+# exploits what a zero-shot TSFM *cannot* see. With covariates or cross-learning switched off,
+# Chronos and TimesFM forecast one series from its own recent values alone:
+#
+# * **They are date-blind.** They see a sequence of numbers, not a calendar. A holiday or a school
+#   break has to be recognised from the shape of the history, or passed in as a covariate.
+# * **They see one series at a time.** Unless cross-learning is on, they cannot know that the
+#   store across town always doubles its milkshake sales in July.
+# * **They learn covariate effects in-context**, from one series' history. Effects that only show
+#   up in rare combinations (a threshold, an interaction) leave few examples to learn from.
+#
+# Each scenario below targets one of these gaps. The hypotheses were written down **before** the
+# run:
+#
+# | Scenario | What the data does | Why TSFMs should struggle | Who should win |
+# |---|---|---|---|
+# | `seasonal_cold_start` | A new store opens 41 days before each origin, just before the summer peak, the autumn drop and the December rush. Seasonality is 2× baseline, plus a holiday-shopping surge at mall and suburban stores. | Six weeks of history cannot show a yearly swing. | Pooled models: Bayesian (shared item seasonality) and LightGBM (day-of-year features learnt across stores). Maybe Chronos-2 with cross-learning. |
+# | `annual_calendar` | Downtown stores are on a campus: −50% during school breaks. July 4, a 10-day state fair (region 1), holiday-party catering, Christmas Eve and the post-Christmas lull recur on the **same dates every year**. None of it is in `COVARIATES`. | The signal is in the history, but a year back. A date-blind model must recall it from the year-ago part of its context. | MSTL (explicit yearly component) and LightGBM (last-year-same-date feature). The Bayesian model's smooth Fourier seasonality should miss the sharp edges. |
+# | `nonlinear_drivers` | Promo, temperature and rain are passed as covariates, but act non-linearly. Promo lift depends on store type × weekday (downtown: weekdays only; mall: weekends). Heat matters only above ~88°F, near-freezing rain empties the store, and rain hurts only on weekends. | In-context regression on one series' history, with few examples of the rare combinations. | LightGBM (trees find thresholds and interactions). The Bayesian model is linear in covariates, so it is misspecified too. |
+
+# %%
+STRESS_SCENARIOS = [
+    Scenario("seasonal_cold_start", "New store before a seasonal swing",
+             "S3/S4/S5 open 41 days before origins 1/2/3, just ahead of the summer peak, the autumn drop and the "
+             "December rush. Seasonality is 2× baseline, plus a holiday-shopping surge at mall and suburban stores.",
+             staggered_openings=True, yearly_strength=2.0, holiday_season=0.4),
+    Scenario("annual_calendar", "Academic calendar & annual events",
+             "Campus (downtown) stores halve during school breaks; July 4, a state fair, holiday parties, Christmas Eve "
+             "and the post-Christmas lull recur on the same dates every year. None of it is passed as a covariate.",
+             annual_calendar=True),
+    Scenario("nonlinear_drivers", "Interacting drivers",
+             "Covariates are given but act through thresholds and interactions: promo lift depends on store type × "
+             "weekday, heat matters only above ~88°F, near-freezing rain empties stores, rain only hurts on weekends.",
+             promo_per_year=8, nonlinear_drivers=True),
+]
+SCENARIO_BY_NAME |= {s.name: s for s in STRESS_SCENARIOS}
+DATA |= {s.name: simulate(s) for s in STRESS_SCENARIOS}
+
+fig = plt.figure(figsize=(11, 10))
+gs = fig.add_gridspec(3, 2, height_ratios=[1, 1, 1.1])
+ax1, ax2 = fig.add_subplot(gs[0, :]), fig.add_subplot(gs[1, :])
+ax3, ax4 = fig.add_subplot(gs[2, 0]), fig.add_subplot(gs[2, 1])
+
+# (1) A new store sees six weeks; its sibling of the same type shows what comes next.
+d = DATA["seasonal_cold_start"]
+for uid, color, lw, label in [("S2/sandwich", "#a3a29d", 1.4, "S2 (established mall store)"),
+                              ("S5/sandwich", FAMILY_COLORS["Foundation"], 2.0, "S5 (new mall store)")]:
+    g = d.query("unique_id == @uid and ds >= '2024-06-01'")
+    ax1.plot(g.ds, g.y.rolling(7, min_periods=1).mean(), color=color, lw=lw, label=label)
+o3 = ORIGINS_ALL[2]
+ax1.axvline(o3, color=INK_2, ls="--", lw=0.9)
+ax1.axvspan(o3, o3 + pd.Timedelta(days=H), color=GRID, alpha=0.6, lw=0)
+ax1.annotate("S5's whole history\nat the last origin", (o3 - pd.Timedelta(days=21), ax1.get_ylim()[1] * 0.9),
+             ha="center", va="top", fontsize=9, color=INK_2)
+ax1.set_title("New store before a seasonal swing · sandwich, 7-day mean")
+ax1.set_ylabel("units / day")
+ax1.legend(loc="upper left")
+
+# (2) Campus store: the school calendar and annual events repeat every year.
+g = DATA["annual_calendar"].query("unique_id == 'S0/sandwich'")
+ax2.plot(g.ds, g.y, color=INK_2, lw=0.6, alpha=0.55)
+ax2.plot(g.ds, g.y.rolling(7, min_periods=1, center=True).mean(), color=FAMILY_COLORS["Foundation"], lw=1.8)
+off = g.off_term.to_numpy() == 1
+for block in np.split(np.flatnonzero(off), np.flatnonzero(np.diff(np.flatnonzero(off)) > 1) + 1):
+    if len(block):
+        ax2.axvspan(g.ds.iloc[block[0]], g.ds.iloc[block[-1]], color=FAMILY_COLORS["Bayesian"], alpha=0.18, lw=0)
+for o in ORIGINS:
+    ax2.axvline(o, color=INK_2, ls="--", lw=0.9)
+ax2.legend(handles=[Patch(color=FAMILY_COLORS["Bayesian"], alpha=0.18, label="school break (not a covariate)")], loc="upper left")
+ax2.set_title("Academic calendar & annual events · campus store S0/sandwich")
+ax2.set_ylabel("units / day")
+
+# (3) Threshold: milkshake demand vs temperature.
+d = DATA["nonlinear_drivers"].query("item == 'milkshake' and store == 'S3' and promo == 0 and rain == 0")
+ratio = d.y / d.y.median()
+ax3.scatter(d.temp, ratio, s=8, color=FAMILY_COLORS["Foundation"], alpha=0.35, lw=0)
+ax3.axvline(88, color=INK_2, ls="--", lw=0.9)
+ax3.annotate("88°F", (88, ratio.quantile(0.995)), xytext=(4, 0), textcoords="offset points", fontsize=9, color=INK_2)
+ax3.set_xlabel("temperature °F")
+ax3.set_ylabel("demand ÷ median")
+ax3.set_title("Interacting drivers · heat threshold (S3/milkshake)")
+
+# (4) Interaction: promo lift by store type and weekday.
+d = DATA["nonlinear_drivers"].assign(weekend=lambda x: np.where(x.ds.dt.dayofweek >= 5, "weekend", "weekday"))
+lift = (d.groupby(["store_type", "weekend", "promo"]).y.mean().unstack("promo").pipe(lambda t: t[1.0] / t[0.0] - 1)).unstack("weekend")
+x = np.arange(len(lift))
+for k, (col, color) in enumerate(zip(["weekday", "weekend"], ["#a3a29d", INK])):
+    ax4.bar(x + (k - 0.5) * 0.38, lift[col] * 100, width=0.36, color=color, label=col)
+ax4.set_xticks(x, lift.index)
+ax4.axhline(0, color=INK_2, lw=0.8)
+ax4.set_ylabel("promo lift, %")
+ax4.set_title("Interacting drivers · promo lift by store type")
+ax4.legend(loc="upper right")
+fig.tight_layout()
+plt.show()
+
+# %% [markdown]
+# ### 7a. Results
+# Same backtest, same methods, same metrics. The cell is coloured by WQL relative to seasonal
+# naive within each scenario.
+
+# %%
+FORECASTS_STRESS = {sc.name: add_ensemble(run_scenario(sc)) for sc in STRESS_SCENARIOS}
+SUMMARY_STRESS = pd.concat({n: summarize(fc) for n, fc in FORECASTS_STRESS.items()}, names=["scenario", "method"])
+plot_relative_heatmap(SUMMARY_STRESS)
+
+# %%
+TSFM = [m for m, (f, _) in METHODS.items() if f == "Foundation"]
+
+
+def tsfm_gap(summary):
+    rows = {}
+    for name, g in summary["WQL"].groupby(level="scenario"):
+        g = g.droplevel("scenario").dropna()
+        fm, other = g[g.index.isin(TSFM)], g[~g.index.isin(TSFM + ["Oracle"])]
+        rows[SCENARIO_BY_NAME[name].title] = {
+            "oracle": g["Oracle"], "best TSFM": fm.idxmin(), "TSFM WQL": fm.min(),
+            "best other": other.idxmin(), "other WQL": other.min(), "TSFM gap": fm.min() / other.min() - 1,
+        }
+    return pd.DataFrame(rows).T
+
+
+
+# %%
+with pd.option_context("display.float_format", "{:.3f}".format, "display.max_columns", 50, "display.width", 250):
+    for metric in ["WQL", "Cov80"]:
+        print(f"\n{metric}")
+        display(SUMMARY_STRESS[metric].unstack("scenario").reindex(index=METHOD_ORDER, columns=[s.name for s in STRESS_SCENARIOS]).round(3))
+
+# %% [markdown]
+# ### 7b. Affected vs. unaffected stores
+# The new stores in `seasonal_cold_start`, and the campus stores in `annual_calendar`, against the
+# other stores in the same scenario.
+
+# %%
+plot_segments(FORECASTS_STRESS, ["seasonal_cold_start", "annual_calendar"]);
+
+# %% [markdown]
+# ### 7c. What the misses look like
+
+# %%
+plot_cases(FORECASTS_STRESS, [
+    ("seasonal_cold_start", "S5/sandwich", ORIGINS[-1], "New mall store\nbefore the December rush"),
+    ("annual_calendar", "S0/sandwich", ORIGINS[-1], "Campus store:\nwinter break from Dec 14"),
+    ("annual_calendar", "S3/nuggets", ORIGINS[min(1, len(ORIGINS) - 1)], "State fair\nSep 27–Oct 6"),
+    ("nonlinear_drivers", "S3/milkshake", ORIGINS[0], "Heat threshold\nin July"),
+], show=["TimesFM 2.5", "Chronos-2 +cov", "MSTL", "LightGBM", "Bayes hierarchical"])
+
+# %% [markdown]
+# ### 7d. Is it the model or the missing information?
+# The calendar in `annual_calendar` was known in advance: school terms and event dates are
+# published. Here we re-run Chronos-2 and LightGBM on that scenario **with the calendar passed as
+# covariates** (`off_term`, `event_up`, `event_down`). If the TSFM gap closes, the lesson is "tell
+# the model what you know", not "the model can't do it".
+
+# %%
+CALENDAR_COVARIATES = ["off_term", "event_up", "event_down"]
+calendar_path = RESULTS_DIR / "forecasts_annual_calendar_with_calendar.parquet"
+if calendar_path.exists() and not RECOMPUTE:
+    with_calendar = pd.read_parquet(calendar_path)
+else:
+    df, frames = DATA["annual_calendar"], []
+    for origin in ORIGINS:
+        train = df[df.ds <= origin].drop(columns="mu_true")
+        test = df[(df.ds > origin) & (df.ds <= origin + pd.Timedelta(days=H))]
+        future = test.drop(columns=["y", "mu_true"])
+        for name, fn in {
+            "Chronos-2 +cov +calendar": lambda tr, fu: _fm("chronos2", tr, fu, covariates=COVARIATES + CALENDAR_COVARIATES),
+            "LightGBM +calendar": lambda tr, fu: fc_lightgbm(tr, fu, extra_covariates=CALENDAR_COVARIATES),
+        }.items():
+            fc = fn(train, future).merge(test[["unique_id", "ds", "y", "store", "item", "segment"]], on=["unique_id", "ds"])
+            frames.append(fc.assign(method=name, origin=origin, seconds=np.nan, mase_scale=fc.unique_id.map(mase_scale(train))))
+    with_calendar = pd.concat(frames, ignore_index=True)
+    with_calendar.to_parquet(calendar_path)
+
+both = pd.concat([FORECASTS_STRESS["annual_calendar"], with_calendar], ignore_index=True)
+compare = ["Oracle", "MSTL", "Bayes hierarchical", "TimesFM 2.5", "Chronos-2 +cov", "Chronos-2 +cov +calendar",
+           "LightGBM", "LightGBM +calendar"]
+calendar_table = pd.DataFrame({
+    "WQL, all stores": {m: score(both[both.method == m])["WQL"] for m in compare},
+    "WQL, campus stores": {m: score(both[(both.method == m) & (both.segment == "campus store")])["WQL"] for m in compare},
+    "Cov80": {m: score(both[both.method == m])["Cov80"] for m in compare},
+})
+display(calendar_table.round(3))
+
+# %% [markdown]
+# ### 7e. Round 2: information only pooling or structure can supply
+#
+# Round 1 mostly **refuted** the hypotheses (discussion in §7f). Being date-blind costs little when
+# two years of context hold last year's pattern, and 41 days was enough to pick up a new store's
+# weekly rhythm. So round 2 targets information that is **not in the series' own history at all**:
+#
+# | Scenario | What the data does | Why TSFMs should struggle | Who should win |
+# |---|---|---|---|
+# | `price_rollout` | Prices rise 15% store by store (elasticity ≈ −1.3, so demand drops ~17%). S0/S1 went first in March 2024; then one or two stores raise prices 2 days after each origin. `log_price` is a **known covariate**. | A store raising prices for the first time has a constant price in its own history, so in-context regression has nothing to learn the effect from. | LightGBM and the Bayesian model, which learn the effect from the stores that went first. Chronos-2 with cross-learning *can* see those stores in the same batch, which is the direct test of whether that transfer works. |
+# | `fresh_openings` | S3/S4/S5 open just **10 days** before origins 1/2/3, with an opening buzz (+80%) that fades over a month. | Ten days is under two weekly cycles, and the context alone can't say how quickly the buzz fades. | Pooled models: the weekly rhythm comes from the store type, and the buzz decay from earlier openings (LightGBM's `age` feature). |
+
+# %%
+STRESS_2 = [
+    Scenario("price_rollout", "A first-ever price increase",
+             "Prices rise 15% store by store: S0/S1 in March 2024, then one or two stores 2 days after each origin. "
+             "log_price is a known covariate, but the stores raising prices have no precedent in their own history.",
+             price_rollout=True, extra_covariates=("log_price",)),
+    Scenario("fresh_openings", "Store opened 10 days ago",
+             "S3/S4/S5 open 10 days before origins 1/2/3 with an opening buzz that fades over a month.",
+             fresh_openings=True),
+]
+SHORT_TITLES |= {"price_rollout": "First-ever\nprice increase", "fresh_openings": "Store opened\n10 days ago"}
+SCENARIO_BY_NAME |= {s.name: s for s in STRESS_2}
+DATA |= {s.name: simulate(s) for s in STRESS_2}
+FORECASTS_STRESS |= {sc.name: add_ensemble(run_scenario(sc)) for sc in STRESS_2}
+SUMMARY_STRESS = pd.concat({n: summarize(fc) for n, fc in FORECASTS_STRESS.items()}, names=["scenario", "method"])
+plot_relative_heatmap(SUMMARY_STRESS.loc[[s.name for s in STRESS_2]])
+
+
+# %% [markdown]
+# The averages above mix affected and unaffected forecasts. The question is how each method does
+# on the forecasts the scenario is **about**: target days after a store's first price rise, and
+# stores that are ≤10 days old at the origin.
+
+# %%
+def mark_affected(name, fc):
+    d = DATA[name]
+    if name == "price_rollout":
+        price = d.set_index(["unique_id", "ds"]).log_price
+        at_origin = price.reindex(pd.MultiIndex.from_arrays([fc.unique_id, fc.origin])).to_numpy()
+        at_target = price.reindex(pd.MultiIndex.from_arrays([fc.unique_id, fc.ds])).to_numpy()
+        return fc.assign(segment=np.where(at_target != at_origin, "after a first price rise", "established"))
+    first_day = d.groupby("unique_id").ds.min()
+    return fc.assign(segment=np.where((fc.origin - fc.unique_id.map(first_day)).dt.days <= 10, "store ≤10 days old", "established"))
+
+
+AFFECTED = {s.name: mark_affected(s.name, FORECASTS_STRESS[s.name]) for s in STRESS_2}
+seg2 = plot_segments(AFFECTED, [s.name for s in STRESS_2])
+display(seg2[seg2.segment != "established"].pivot(index="method", columns="scenario", values="WQL")
+        .reindex([m for m in METHOD_ORDER if m in seg2.method.unique()]).round(3)
+        .rename(columns=lambda n: f"{n}: WQL on affected forecasts"))
+
+# %%
+plot_cases(FORECASTS_STRESS, [
+    ("price_rollout", "S2/nuggets", ORIGINS[0], "First price rise\n2 days after origin"),
+    ("price_rollout", "S4/milkshake", ORIGINS[-1], "First price rise\n2 days after origin"),
+    ("fresh_openings", "S5/sandwich", ORIGINS[-1], "Opened 10 days\nbefore origin"),
+], show=["TimesFM 2.5", "Chronos-2 +cov", "Chronos-2 +cov +XL", "LightGBM", "Bayes hierarchical"])
+
+# %% [markdown]
+# **The foundation-model gap across every scenario**, original and stress tests: the best
+# foundation model against the best other method (oracle excluded), on all forecasts. A positive gap
+# means the best TSFM has a higher WQL than the best alternative.
+
+# %%
+gap = pd.concat({"original": tsfm_gap(SUMMARY), "stress test": tsfm_gap(SUMMARY_STRESS)}, names=["set", "scenario"])
+display(gap.style.format({"oracle": "{:.3f}", "TSFM WQL": "{:.3f}", "other WQL": "{:.3f}", "TSFM gap": "{:+.0%}"}))
+
+# %% [markdown]
+# ### 7f. What we found
+#
+# *Numbers are WQL from the cached full run (3 origins each), with the oracle in brackets where
+# useful.*
+#
+# **Round 1: my hypotheses were mostly wrong, which is the more interesting result.**
+# * **Academic calendar & annual events.** The TSFMs were among the best methods: Chronos-2 0.194
+#   and TimesFM 0.197, against LightGBM 0.193, MSTL 0.226 and the Bayesian model 0.236 [0.156].
+#   Being date-blind barely matters when two years of context contain last year's state fair and
+#   winter break; they find and replay the year-ago pattern (state-fair row in §7c). The method
+#   hurt most was the *Bayesian* model, whose smooth yearly curve cannot represent a sharp 10-day
+#   event or a term break. Here misspecification bit the structural model, not the TSFMs.
+# * Passing the calendar as covariates still helps both: Chronos-2 0.204 → 0.180 and LightGBM
+#   0.193 → 0.177 (§7d). Telling the model what you know is still worth doing.
+# * **New store before a seasonal swing.** A tie overall (TimesFM 0.185, ensemble 0.185, LightGBM
+#   0.188). On the new stores themselves the TSFMs pay a small penalty (0.78–0.82 of naive vs.
+#   0.755 for LightGBM). 41 days was enough to learn the weekly rhythm, and no method, pooled or
+#   not, fully anticipated the December rush.
+# * **Interacting drivers.** The one confirmed hypothesis, and a small one: LightGBM 0.176 vs.
+#   Chronos-2 +cov 0.182 (+4%). The univariate TSFMs, which never see the covariates, sit at 0.22.
+#
+# **Round 2: the failures are about information that isn't in the series.**
+# * **First-ever price increase.** On the days after a store's first price rise, every TSFM keeps
+#   forecasting the old level (WQL 0.188–0.195 on those forecasts). Chronos-2 is handed `log_price`,
+#   and with cross-learning it sees the stores that raised prices earlier *in the same batch*. It
+#   still does not transfer the effect (0.193 with cross-learning vs. 0.195 without). The Bayesian
+#   model encodes "a price rise has the same effect at every store", learns the elasticity from the
+#   early stores and sits on the oracle (0.155 vs. 0.154). LightGBM (0.192) did no better than the
+#   TSFMs. After March almost every training row with the new price *also* has an origin after the
+#   change, so `log_price` looks uninformative. A feature like "price change since the origin"
+#   would very likely fix it, which is a reminder that the feature engineering is the model.
+# * **Store opened 10 days ago.** The clearest TSFM failure. With under two weekly cycles of
+#   context, Chronos-Bolt (0.295), Chronos-2 (0.273) and Chronos-2 +cov (0.303) do **worse than
+#   seasonal naive** (0.264), forecasting flat lines with very wide intervals. Cross-learning is the
+#   one TSFM feature that helps (0.303 → 0.250), which is what it is designed for. Pooling with
+#   explicit structure is better still: LightGBM 0.236, Bayesian model 0.210 [0.148].
+#
+# **The pattern.** Across ten scenarios, the best TSFM came within 0–4% of the best alternative
+# wherever the answer is in the series' own history, even a year back. The large gaps, +7% to
+# +10% overall and 20–40% on the affected forecasts, all appear where the answer has to come from
+# *somewhere else*: other stores' experience (a price change, a new store's weekly rhythm) or an
+# explicit structural assumption (the elasticity is shared). Zero-shot TSFMs are very strong
+# pattern-continuers. They are not yet good at borrowing an *effect* from other series, even when
+# cross-learning puts those series in view.
+#
+# **Caveats specific to this section.**
+# * I designed these scenarios knowing the methods. The price-rollout data has exactly the
+#   shared-elasticity structure the Bayesian model assumes, so its near-oracle score is the best
+#   case for structural modelling.
+# * The Bayesian fit for `fresh_openings` at the first origin had 14 divergent transitions (out of
+#   1,200 draws), so treat that single fit with some caution (§7 diagnostics are in
+#   `results/full/bayes_diagnostics_*.parquet`).
+# * Round 1 shows how easy it is to guess wrong about where TSFMs fail. Test, don't assume.
+#
+# **Questions for discussion**
+# 1. For the price rollout, what would it take for a TSFM to transfer the effect? Fine-tuning on
+#    the early stores? A covariate that encodes "change since the origin"? Or a hybrid where a
+#    structural model handles the intervention and the TSFM forecasts the residual?
+# 2. How much of your real forecasting work is "continue the pattern", and how much is "apply an
+#    effect learned elsewhere" (new stores, price changes, menu launches)?
+# 3. Cross-learning helped the 10-day stores but not the price change. What is different about
+#    the two kinds of information?
 
 # %%
 FM_POOL.shutdown()
