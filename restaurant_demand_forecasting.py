@@ -38,13 +38,135 @@
 # - Hyndman & Athanasopoulos, *Forecasting: Principles and Practice* (3rd ed.), on ETS, ARIMA, MSTL and accuracy measures
 # - Makridakis et al., *M5 accuracy competition* (2022), where LightGBM global models won on retail data
 #
-# Sections 1–6 cover five everyday scenarios. **Section 7 is a set of stress tests**: data built to
+# **Section 0** is a primer on how TSFMs work. Sections 1–6 cover five everyday scenarios.
+# **Section 7 is a set of stress tests**: data built to
 # make the foundation models fail, with hypotheses written down before each run. Several of the
 # hypotheses turned out to be wrong.
 #
 # > Running the whole backtest from scratch takes about 1.5 hours on a laptop CPU, mostly for
 # > the Bayesian model. Forecasts are cached in `results/`, so re-running the notebook only
 # > re-scores and re-plots them. Set `FAST=1` in the environment for a quick smoke-test run.
+
+# %% [markdown]
+# ## 0. Primer: what is a time-series foundation model?
+#
+# A **time-series foundation model (TSFM)** is one large neural network pretrained on a very wide
+# collection of time series (energy, traffic, weather, retail, web traffic and more, plus a lot of
+# synthetic data). It can forecast **a series it has never seen without being trained on it**: you
+# hand it the recent history (the *context*) and it returns a forecast, usually as quantiles. The
+# analogy with large language models is deliberate. An LLM continues a text it has never seen, and
+# a TSFM continues a series it has never seen.
+#
+# That changes the workflow:
+#
+# | | Classical / ML forecasting | Zero-shot TSFM |
+# |---|---|---|
+# | Training on your data | a model per series (ETS, ARIMA) or per dataset (LightGBM) | none: one pretrained checkpoint |
+# | Feature engineering | lags, calendar features, rolling means, … | none required; covariates optional (Chronos-2) |
+# | What "learning" means at forecast time | parameters fitted to your history | **in-context**: the model reads the history and adapts inside a single forward pass; its weights never change |
+# | Cost | fitting (seconds to hours), then cheap prediction | no fitting; one forward pass (≈1 s for 30 series × 28 days on a laptop CPU here) |
+#
+# ### How they work
+#
+# All three models used here follow the same recipe:
+#
+# ```
+#  history ──► 1. scale ──────► 2. patch ────────► 3. transformer ─────► 4. quantile head ────► 5. unscale ──► quantiles for
+#  y₁ … y_T    by the series'   chop into 16–32-   attention across     a set of quantiles                   T+1 … T+h
+#              own mean/spread  step "tokens"      patches (and, in     for every future
+#                                                  Chronos-2, across    step, in one shot
+#                                                  related series)
+# ```
+#
+# 1. **Scaling (instance normalisation).** Each context is normalised by its own level and spread,
+#    so a store selling 5 milkshakes a day and one selling 500 look alike to the network. This is
+#    how one model handles any scale. It is also why the level must be inferred from the context alone.
+# 2. **Patching.** The history is chopped into fixed-length patches (16 steps for Chronos-Bolt and
+#    Chronos-2, 32 for TimesFM 2.5), and each patch is embedded as one token, like a word piece in an
+#    LLM. The original 2024 Chronos instead quantised every value into one of 4,096 bins and treated
+#    the series literally as a sentence of bin tokens.
+# 3. **A transformer.** Attention lets every patch look at every other patch in the context. That
+#    is how a model can "notice" that the last two Decembers looked alike, or that a 7-day cycle runs
+#    through the history. The architectures differ (table below).
+# 4. **Output head.** Current TSFMs predict a fixed set of **quantiles** for many future steps at
+#    once ("direct multi-step"). They are trained with the quantile (pinball) loss, the same loss
+#    behind this notebook's WQL metric. The original Chronos sampled future paths token by token,
+#    which is far slower.
+# 5. **Unscaling.** Quantiles are mapped back to the original units.
+#
+# **Pretraining** is where the "foundation" comes from. The models are trained on billions of
+# observations from public datasets across many domains, augmented with synthetic series. For
+# example, Chronos' *KernelSynth* generates random mixtures of trends, seasonalities and noise from
+# Gaussian-process kernels. What the model learns is generic: seasonality, trends, level shifts,
+# mean reversion, intermittency, and how uncertainty grows with the horizon. It knows nothing about
+# restaurants.
+#
+# ### The models in this notebook
+#
+# | | Chronos-Bolt (base) | TimesFM 2.5 | Chronos-2 |
+# |---|---|---|---|
+# | From | Amazon, Nov 2024 | Google, Sep 2025 | Amazon, Oct 2025 |
+# | Parameters | 205M | 200M (+ optional 30M quantile head) | 120M |
+# | Architecture | T5 encoder–decoder | decoder-only (GPT-style) | encoder-only, alternating attention over time and **across series** ("group attention") |
+# | Patch length | 16 | 32 in, 128 out | 16 |
+# | Max context | 2,048 steps | 16,384 steps | 8,192 steps |
+# | Output | 9 quantiles (0.1–0.9) | mean + 9 quantiles; long horizons decoded 128 steps at a time | 21 quantiles (0.01–0.99) |
+# | Covariates | no | via an add-on per-call linear regression ("XReg"; not used here) | **native**: past-only and known-future covariates |
+# | Cross-series | no | no | **yes**: series in one group attend to each other ("cross-learning") |
+# | Weights licence | Apache-2.0 | Apache-2.0 | Apache-2.0 |
+#
+# Chronos-2's group attention is the main new idea. Each layer first attends *over time* within a
+# series, then *across the members of a group*: the target, its covariates and, with
+# cross-learning, other related series. Covariates are simply extra series in the group, which is
+# how it learns their effect in-context without fitting anything.
+#
+# What the models do **not** see is the calendar. None is given calendar features, and Chronos-2's
+# time encoding is only "how many steps before or after the forecast origin". Anything tied to the
+# calendar (weekdays, holidays, school terms) has to be inferred from the shape of the history or
+# passed in as a covariate.
+#
+# ### What they're good at
+# Section references point to the evidence in this notebook.
+# * **Strong forecasts with zero setup.** No training, no features, no tuning, and about a second
+#   for all 30 series. On clean data they beat ETS and ARIMA and came within ~3% of the noise floor (§5a, steady state).
+# * **Recognising patterns in the context**, including long ones: weekly cycles, seasonality, even
+#   last year's state fair and winter break recalled from two years of context (§7, academic calendar).
+# * **Adapting to recent changes** such as a level shift shortly before the origin (§5c, structural breaks).
+# * **Calibrated uncertainty out of the box.** Chronos-Bolt's and TimesFM's 80% intervals covered close to 80% (§5d).
+# * **Using known covariates without feature engineering** (Chronos-2). Promotions, weather and
+#   closures recovered most of a hand-built LightGBM's gain (§5a, drivers).
+# * **Robust on average.** Across all ten scenarios the best TSFM was within 0–10% of the best
+#   method overall (§7, gap table), which makes them good baselines and good ensemble members.
+#
+# ### What they're bad at
+# * **Information that isn't in the series' own history.** A store's first-ever price rise has
+#   nothing to learn from in-context, even with the price passed as a covariate. The TSFMs forecast
+#   the old level, while a model that shares the price effect across stores gets it right.
+#   Chronos-2's cross-learning did not transfer the effect (§7e).
+# * **Very short histories.** With 10 days of data (under two weekly cycles), most TSFM variants
+#   did *worse than seasonal naive*. Pooled models that borrow the weekly rhythm from similar stores
+#   win. Cross-learning helps, but not enough (§7e).
+# * **Effects that need many examples to learn**, such as thresholds and interactions between
+#   covariates (heat above 88°F, promo × weekday). In-context learning only sees one series'
+#   history, so trees do better (§7, interacting drivers).
+# * **Domain knowledge and constraints.** You cannot tell a TSFM "elasticity is about −1.3", "this
+#   store is closed on Sundays" or "item forecasts must add up to the store total". Structural
+#   (Bayesian) and engineered (ML) models can encode all of these.
+# * **Calibration on low counts.** Chronos-2's intervals were too narrow for intermittent demand (§5d).
+# * **Opacity and governance.** There are no coefficients to inspect, behaviour can change between
+#   checkpoint versions, and licences vary: TimesFM 3.0's weights are for non-commercial use only.
+# * **Cost at very large scale.** They are free on a laptop for 30 series. For millions of
+#   store × item series every day, GPU inference cost and latency start to matter.
+#
+# ### Using them in practice
+# 1. **Use one as the baseline.** It is the cheapest strong forecast you will get, and anything you
+#    build should beat it.
+# 2. **Pass in what you know** (promotions, prices, closures, the calendar) as covariates to a
+#    covariate-capable model. Calendar covariates improved Chronos-2 from 0.204 to 0.180 WQL (§7d).
+# 3. **Ensemble** with a global ML model. That was among the most robust choices here.
+# 4. **Watch the cold-start and intervention cases** (new stores, price changes, menu launches),
+#    and route them to pooled or structural models.
+# 5. **Fine-tune** when zero-shot isn't enough. Chronos and TimesFM both support it, but it is not tested here.
 
 # %%
 import logging
